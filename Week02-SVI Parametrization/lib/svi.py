@@ -3,7 +3,7 @@ import scipy as sp
 import pandas as pd
 import matplotlib.pyplot as plt
 from time import time
-from numba import njit
+from numba import njit, float64, vectorize
 from scipy.stats import norm
 from scipy.special import ndtr
 from scipy.optimize import minimize, minimize_scalar, differential_evolution
@@ -12,6 +12,49 @@ from pricer import BlackScholesFormula, BlackScholesVega
 plt.switch_backend("Agg")
 
 #### Black-Scholes #############################################################
+
+INVROOT2PI = 0.3989422804014327
+
+@njit(float64(float64), fastmath=True, cache=True)
+def _ndtr_jit(x):
+    a1 = 0.319381530
+    a2 = -0.356563782
+    a3 = 1.781477937
+    a4 = -1.821255978
+    a5 = 1.330274429
+    g = 0.2316419
+
+    k = 1.0 / (1.0 + g * np.abs(x))
+    k2 = k * k
+    k3 = k2 * k
+    k4 = k3 * k
+    k5 = k4 * k
+
+    if x >= 0.0:
+        c = (a1 * k + a2 * k2 + a3 * k3 + a4 * k4 + a5 * k5)
+        phi = 1.0 - c * np.exp(-x*x/2.0) * INVROOT2PI
+    else:
+        phi = 1.0 - _ndtr_jit(-x)
+
+    return phi
+
+@vectorize([float64(float64)], fastmath=True, cache=True)
+def ndtr_jit(x):
+    return _ndtr_jit(x)
+
+@njit
+def BlackScholesFormula_jit(spotPrice, strike, maturity, riskFreeRate, impliedVol, optionType):
+    # Black Scholes formula for call/put
+    logMoneyness = np.log(spotPrice/strike)+riskFreeRate*maturity
+    totalImpVol = impliedVol*np.sqrt(maturity)
+    discountFactor = np.exp(-riskFreeRate*maturity)
+    d1 = logMoneyness/totalImpVol+totalImpVol/2
+    d2 = d1-totalImpVol
+
+    if optionType == 'call':
+        return spotPrice * ndtr_jit(d1) - discountFactor * strike * ndtr_jit(d2)
+    else:
+        return discountFactor * strike * ndtr_jit(-d2) - spotPrice * ndtr_jit(-d1)
 
 def BlackScholesFormula_fast(spotPrice, strike, maturity, riskFreeRate, impliedVol, optionType):
     # Black Scholes formula for call/put
@@ -387,12 +430,23 @@ def sviSqrt(w0, rho, eta):
         return w0/2*(1+rho*sk*k+np.sqrt((sk*k+rho)**2+1-rho**2))
     return sviFunc
 
+@njit
+def sviSqrt_jit(k, w0, rho, eta):
+    # Sqrt-SVI parametrization
+    sk = eta/np.sqrt(w0) # Sqrt skew decay
+    return w0/2*(1+rho*sk*k+np.sqrt((sk*k+rho)**2+1-rho**2))
+
 def sviPowerLaw(w0, rho, eta, gam):
     # PowerLaw-SVI parametrization
     def sviFunc(k):
         sk = eta/(w0**gam*(1+w0)**(1-gam)) # PowerLaw skew decay
         return w0/2*(1+rho*sk*k+np.sqrt((sk*k+rho)**2+1-rho**2))
     return sviFunc
+
+@njit
+def sviPowerLaw_jit(k, w0, rho, eta, gam):
+    sk = eta/(w0**gam*(1+w0)**(1-gam)) # PowerLaw skew decay
+    return w0/2*(1+rho*sk*k+np.sqrt((sk*k+rho)**2+1-rho**2))
 
 def sviHeston(w0, rho, eta, lda):
     # Heston-SVI parametrization
@@ -401,6 +455,11 @@ def sviHeston(w0, rho, eta, lda):
         return w0/2*(1+rho*sk*k+np.sqrt((sk*k+rho)**2+1-rho**2))
     return sviFunc
 
+@njit
+def sviHeston_jit(k, w0, rho, eta, lda):
+    sk = eta*(1-(1-np.exp(-lda*w0))/(lda*w0))/(lda*w0) # Heston skew decay
+    return w0/2*(1+rho*sk*k+np.sqrt((sk*k+rho)**2+1-rho**2))
+
 def esviPowerLaw(w0, eta, gam, rho0, rho1, wmax, a):
     # PowerLaw-eSVI parametrization
     def sviFunc(k):
@@ -408,6 +467,12 @@ def esviPowerLaw(w0, eta, gam, rho0, rho1, wmax, a):
         rho = rho0-(rho0-rho1)*(w0/wmax)**a # PowerLaw corr decay
         return w0/2*(1+rho*sk*k+np.sqrt((sk*k+rho)**2+1-rho**2))
     return sviFunc
+
+@njit
+def esviPowerLaw_jit(k, w0, eta, gam, rho0, rho1, wmax, a):
+    sk = eta/(w0**gam*(1+w0)**(1-gam)) # PowerLaw skew decay
+    rho = rho0-(rho0-rho1)*(w0/wmax)**a # PowerLaw corr decay
+    return w0/2*(1+rho*sk*k+np.sqrt((sk*k+rho)**2+1-rho**2))
 
 #### Arbitrage Check ###########################################################
 
@@ -460,10 +525,20 @@ def FitSimpleSVI(df, sviGuess=None, initParamsMode=0):
         midVar = (bid**2+ask**2)/2
         sprdVar = (ask**2-bid**2)/2
 
+        k = k.to_numpy()
+        midVar = midVar.to_numpy()
+        sprdVar = sprdVar.to_numpy()
+
+        @njit
+        def varToL2Loss(sviVar): # Fast loss computation!
+            return np.sum(((sviVar-midVar)/sprdVar)**2)
+
         def loss(params): # L2 loss
-            sviVar = svi(*params)(k)
+            # sviVar = svi(*params)(k)
+            sviVar = svi_jit(k,*params)
             # return sum((sviVar-midVar)**2)
-            return sum(((sviVar-midVar)/sprdVar)**2)
+            # return sum(((sviVar-midVar)/sprdVar)**2)
+            return varToL2Loss(sviVar)
 
         # Initial params
         if sviGuess is None:
@@ -537,8 +612,8 @@ def FitArbFreeSimpleSVI(df, sviGuess=None, initParamsMode=0, cArbPenalty=10000, 
         def l2Loss(params): # L2 loss
             # sviVar = svi(*params)(k)/T
             sviVar = svi_jit(k,*params)/T
-            # callSvi = BlackScholesFormula(F,K,T,0,np.sqrt(np.abs(sviVar)),'call')
-            callSvi = BlackScholesFormula_fast(F,K,T,0,np.sqrt(np.abs(sviVar)),'call')
+            callSvi = BlackScholesFormula_jit(F,K,T,0,np.sqrt(np.abs(sviVar)),'call')
+            # callSvi = BlackScholesFormula_fast(F,K,T,0,np.sqrt(np.abs(sviVar)),'call')
             # loss = sum(w*(callSvi-callMid)**2)
             loss = prxToL2Loss(callSvi)
             return loss
@@ -612,14 +687,23 @@ def FitSqrtSVI(df, sviGuess=None, Tcut=0.2):
         spline = InterpolatedUnivariateSpline(kT[ntm], vT[ntm])
         w0[i] = spline(0).item()*T # ATM total variance
 
+    @njit
+    def varToL2Loss(sviVar): # Fast loss computation!
+        if Tcut: # Fit to longer-term slices
+            return np.sum((((sviVar-midVar)/sprdVar)**2)[T0>=Tcut])
+        else: # Fit to all slices
+            return np.sum(((sviVar-midVar)/sprdVar)**2)
+
     def loss(params): # L2 loss
         sviVar = sviSqrt(w0,*params)(k)/T0
+        # sviVar = sviSqrt_jit(k,w0,*params)/T0
         # return sum((sviVar-midVar)**2)
         # return sum(((sviVar-midVar)/sprdVar)**2)
         if Tcut: # Fit to longer-term slices
             return sum((((sviVar-midVar)/sprdVar)**2)[T0>=Tcut])
         else: # Fit to all slices
             return sum(((sviVar-midVar)/sprdVar)**2)
+        # return varToL2Loss(sviVar)
 
     # Initial params
     if sviGuess is None:
@@ -679,29 +763,41 @@ def FitSurfaceSVI(df, sviGuess=None, skewKernel='PowerLaw', Tcut=0.2):
     # SVI function & initial params
     if skewKernel == 'Sqrt':
         sviFunc = sviSqrt
+        # sviFunc = sviSqrt_jit
         skFunc = lambda w0,eta: eta/np.sqrt(w0)
         params0 = (-0.7, 1) if sviGuess is None else sviGuess
         bounds0 = ((-0.99, 0.99), (-10, 10))
     elif skewKernel == 'PowerLaw':
         sviFunc = sviPowerLaw
+        # sviFunc = sviPowerLaw_jit
         skFunc = lambda w0,eta,gam: eta/(w0**gam*(1+w0)**(1-gam))
         params0 = (-0.7, 1, 0.3) if sviGuess is None else sviGuess
         # bounds0 = ((-0.99, 0.99), (-10, 10), (0.01, 0.5))
         bounds0 = ((-0.99, 0.99), (-10, 10), (0.01, 1)) # modified: gam
     elif skewKernel == 'Heston':
         sviFunc = sviHeston
+        # sviFunc = sviHeston_jit
         skFunc = lambda w0,eta,lda: eta*(1-(1-np.exp(-lda*w0))/(lda*w0))/(lda*w0)
         params0 = (-0.7, 50, 100) if sviGuess is None else sviGuess
         bounds0 = ((-0.99, 0.99), (-1000, 1000), (0, 1000))
 
+    @njit
+    def varToL2Loss(sviVar): # Fast loss computation!
+        if Tcut: # Fit to longer-term slices
+            return np.sum((((sviVar-midVar)/sprdVar)**2)[T0>=Tcut])
+        else: # Fit to all slices
+            return np.sum(((sviVar-midVar)/sprdVar)**2)
+
     def loss(params): # L2 loss
         sviVar = sviFunc(w0,*params)(k)/T0
+        # sviVar = sviFunc(k,w0,*params)/T0
         # return sum((sviVar-midVar)**2)
         # return sum(((sviVar-midVar)/sprdVar)**2)
         if Tcut: # Fit to longer-term slices
             return sum((((sviVar-midVar)/sprdVar)**2)[T0>=Tcut])
         else: # Fit to all slices
             return sum(((sviVar-midVar)/sprdVar)**2)
+        # return varToL2Loss(sviVar)
 
     opt = minimize(loss, x0=params0, bounds=bounds0)
     # opt = differential_evolution(loss, bounds=bounds0)
@@ -754,20 +850,30 @@ def FitExtendedSurfaceSVI(df, sviGuess=None, Tcut=0.2):
 
     # SVI function & initial params
     sviFunc = esviPowerLaw
+    # sviFunc = esviPowerLaw_jit
     skFunc = lambda w0,eta,gam: eta/(w0**gam*(1+w0)**(1-gam))
     rhoFunc = lambda w0,rho0,rho1,wmax,a: rho0-(rho0-rho1)*(w0/wmax)**a
     params0 = (1, 0.3, -0.7, -0.8, 2, 0.5) if sviGuess is None else sviGuess
     # bounds0 = ((-10, 10), (0.01, 0.5), (-0.99, 0.99), (-0.99, 0.99), (0.01, 10), (0, 10))
     bounds0 = ((-10, 10), (0.01, 1), (-0.99, 0.99), (-0.99, 0.99), (0.01, 10), (0, 1)) # modified: gam,a
 
+    # @njit
+    # def varToL2Loss(sviVar): # Fast loss computation!
+    #     if Tcut: # Fit to longer-term slices
+    #         return np.sum((((sviVar-midVar)/sprdVar)**2)[T0>=Tcut])
+    #     else: # Fit to all slices
+    #         return np.sum(((sviVar-midVar)/sprdVar)**2)
+
     def loss(params): # L2 loss
         sviVar = sviFunc(w0,*params)(k)/T0
+        # sviVar = sviFunc(k,w0,*params)/T0
         # return sum((sviVar-midVar)**2)
         # return sum(((sviVar-midVar)/sprdVar)**2)
         if Tcut: # Fit to longer-term slices
             return sum((((sviVar-midVar)/sprdVar)**2)[T0>=Tcut])
         else: # Fit to all slices
             return sum(((sviVar-midVar)/sprdVar)**2)
+        # return varToL2Loss(sviVar)
 
     opt = minimize(loss, x0=params0, bounds=bounds0)
     # opt = differential_evolution(loss, bounds=bounds0)
@@ -789,6 +895,13 @@ def FitExtendedSurfaceSVI(df, sviGuess=None, Tcut=0.2):
     fit = pd.DataFrame(fit)
     fit.index = Texp
 
+    return fit
+
+def FitArbFreeSimpleSVIWithSimSeed(df, initParamsMode=0, cArbPenalty=10000):
+    # Fit Simple SVI to each slice guaranteeing no static arbitrage with Simple-SVI seed
+    # Columns: "Expiry","Texp","Strike","Bid","Ask","Fwd","CallMid","PV"
+    guess = FitSimpleSVI(df)
+    fit = FitArbFreeSimpleSVI(df, guess, initParamsMode, cArbPenalty)
     return fit
 
 def FitArbFreeSimpleSVIWithSqrtSeed(df, initParamsMode=0, cArbPenalty=10000, Tcut=0.2):
@@ -862,7 +975,8 @@ def SVIVolSurface(fit):
     # ivSurface applies to vector k & T
     Texp = fit.index.to_numpy()
     def ivSurface(k,T):
-        grid = np.array([svi(*fit.loc[t])(k) for t in Texp])
+        # grid = np.array([svi(*fit.loc[t])(k) for t in Texp])
+        grid = np.array([svi_jit(k,*fit.loc[t]) for t in Texp])
         surf = np.array([PchipInterpolator(Texp,grid[:,i])(T) for i in range(len(k))])
         surf = np.sqrt(surf/T).T
         return surf

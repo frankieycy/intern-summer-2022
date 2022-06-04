@@ -1,57 +1,34 @@
 import re
+import datetime
 import numpy as np
 import pandas as pd
+from dateutil import parser
 from tqdm import tqdm
 from time import time
-from dateutil import parser
-from scipy.special import ndtr
-from scipy.optimize import minimize
-
-#### Black-Scholes #############################################################
-
-def BlackScholesFormula(spotPrice, strike, maturity, riskFreeRate, impliedVol, optionType):
-    # Black-Scholes formula for call/put
-    logMoneyness = np.log(spotPrice/strike)+riskFreeRate*maturity
-    totalImpVol = impliedVol*np.sqrt(maturity)
-    discountFactor = np.exp(-riskFreeRate*maturity)
-    d1 = logMoneyness/totalImpVol+totalImpVol/2
-    d2 = d1-totalImpVol
-
-    price = np.where(optionType == "call",
-        spotPrice * ndtr(d1) - discountFactor * strike * ndtr(d2),
-        discountFactor * strike * ndtr(-d2) - spotPrice * ndtr(-d1))
-    return price
-
-def BlackScholesDelta(spotPrice, strike, maturity, riskFreeRate, impliedVol, optionType):
-    # Black-Scholes delta for call/put
-    logMoneyness = np.log(spotPrice/strike)+riskFreeRate*maturity
-    totalImpVol = impliedVol*np.sqrt(maturity)
-    d1 = logMoneyness/totalImpVol+totalImpVol/2
-    return np.where(optionType == "call", ndtr(d1), -ndtr(-d1))
-
-def BlackScholesImpliedVol(spotPrice, strike, maturity, riskFreeRate, priceMkt, optionType="OTM"):
-    # Black-Scholes implied volatility for call/put/OTM
-    forwardPrice = spotPrice*np.exp(riskFreeRate*maturity)
-    impVol = np.zeros(len(strike))
-
-    if optionType == "OTM":
-        optionType = np.where(strike > forwardPrice, "call", "put")
-
-    impVol0 = np.repeat(1e-10, len(strike))
-    impVol1 = np.repeat(10., len(strike))
-    price0 = BlackScholesFormula(spotPrice, strike, maturity, riskFreeRate, impVol0, optionType)
-    price1 = BlackScholesFormula(spotPrice, strike, maturity, riskFreeRate, impVol1, optionType)
-
-    while np.mean(impVol1-impVol0) > 1e-10:
-        impVol = (impVol0+impVol1)/2
-        price = BlackScholesFormula(spotPrice, strike, maturity, riskFreeRate, impVol, optionType)
-        price0 += (price<priceMkt)*(price-price0)
-        impVol0 += (price<priceMkt)*(impVol-impVol0)
-        price1 += (price>=priceMkt)*(price-price1)
-        impVol1 += (price>=priceMkt)*(impVol-impVol1)
-    return impVol
+from pricer import *
 
 #### Options Chain #############################################################
+
+def GenerateYfinOptionsChainDataset(fileName, underlying="^SPX"):
+    # Generate options chain dataset from yahoo_fin
+    # Bad data (unavailable bids/asks) for large maturities
+    from yahoo_fin import options
+    optionDates = options.get_expiration_dates(underlying)
+    optionChains = []
+    for date in tqdm(optionDates):
+        try:
+            chainPC = options.get_options_chain(underlying,date)
+            # print(chainPC)
+            for putCall in ["puts","calls"]:
+                chain = chainPC[putCall]
+                chain["Maturity"] = date
+                chain["Put/Call"] = putCall
+                chain = chain[["Maturity","Put/Call","Contract Name","Last Trade Date","Strike","Last Price","Bid","Ask","Change","% Change","Volume","Open Interest","Implied Volatility"]]
+                optionChains.append(chain)
+        except Exception: pass
+    optionChains = pd.concat(optionChains)
+    optionChains.to_csv(fileName, index=False)
+    return optionChains
 
 def StandardizeOptionsChainDataset(df, onDate):
     # Standardize options chain dataset
