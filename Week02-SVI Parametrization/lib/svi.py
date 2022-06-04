@@ -2,13 +2,11 @@ import numpy as np
 import scipy as sp
 import pandas as pd
 import matplotlib.pyplot as plt
-from time import time
 from numba import njit, float64, vectorize
 from scipy.stats import norm
 from scipy.special import ndtr
 from scipy.optimize import minimize, minimize_scalar, differential_evolution
 from scipy.interpolate import InterpolatedUnivariateSpline, PchipInterpolator
-from pricer import BlackScholesFormula, BlackScholesVega
 plt.switch_backend("Agg")
 
 #### Black-Scholes #############################################################
@@ -56,7 +54,7 @@ def BlackScholesFormula_jit(spotPrice, strike, maturity, riskFreeRate, impliedVo
     else:
         return discountFactor * strike * ndtr_jit(-d2) - spotPrice * ndtr_jit(-d1)
 
-def BlackScholesFormula_fast(spotPrice, strike, maturity, riskFreeRate, impliedVol, optionType):
+def BlackScholesFormula(spotPrice, strike, maturity, riskFreeRate, impliedVol, optionType):
     # Black Scholes formula for call/put
     logMoneyness = np.log(spotPrice/strike)+riskFreeRate*maturity
     totalImpVol = impliedVol*np.sqrt(maturity)
@@ -68,6 +66,13 @@ def BlackScholesFormula_fast(spotPrice, strike, maturity, riskFreeRate, impliedV
         return spotPrice * ndtr(d1) - discountFactor * strike * ndtr(d2)
     else:
         return discountFactor * strike * ndtr(-d2) - spotPrice * ndtr(-d1)
+
+def BlackScholesVega(spotPrice, strike, maturity, riskFreeRate, impliedVol, optionType):
+    # Black Scholes vega for call/put
+    logMoneyness = np.log(spotPrice/strike)+riskFreeRate*maturity
+    totalImpVol = impliedVol*np.sqrt(maturity)
+    d1 = logMoneyness/totalImpVol+totalImpVol/2
+    return spotPrice * np.sqrt(maturity) * norm.pdf(d1)
 
 #### Parametrization ###########################################################
 
@@ -613,7 +618,7 @@ def FitArbFreeSimpleSVI(df, sviGuess=None, initParamsMode=0, cArbPenalty=10000, 
             # sviVar = svi(*params)(k)/T
             sviVar = svi_jit(k,*params)/T
             callSvi = BlackScholesFormula_jit(F,K,T,0,np.sqrt(np.abs(sviVar)),'call')
-            # callSvi = BlackScholesFormula_fast(F,K,T,0,np.sqrt(np.abs(sviVar)),'call')
+            # callSvi = BlackScholesFormula(F,K,T,0,np.sqrt(np.abs(sviVar)),'call')
             # loss = sum(w*(callSvi-callMid)**2)
             loss = prxToL2Loss(callSvi)
             return loss
@@ -1022,3 +1027,247 @@ def SVIAtmTermStructure(df, type='vol'):
     ts.index = T
 
     return ts
+
+#### Batch Fitting #############################################################
+
+def BatchFitArbFreeSimpleSVI(dfs):
+    # Fit Simple SVI to each slice guaranteeing no static arbitrage
+    # dfs: dict of standardized options chain df labeled by dates
+    fits = dict()
+    for T in dfs:
+        print('------------------------------------------')
+        print(f'fitting arb-free simple SVI for T={T}')
+        print('------------------------------------------')
+        fits[T] = FitArbFreeSimpleSVIWithSimSeed(dfs[T])
+    return fits
+
+def SVIVolSurfaceStats(fits, Texp=None):
+    # SVI vol surface statistics e.g. ATM vol/skew
+    # dfs: dict of SVI fit labeled by dates
+    # Texp: expiries to extract stats
+    EPS = 1e-5
+    ts = dict()
+    if Texp is not None:
+        k = np.array([-EPS,0,EPS])
+        Texp = np.array(Texp)
+    for T in fits:
+        print(f'computing vol surface stats for T={T}')
+        if Texp is None:
+            ts[T] = SVIAtmTermStructure(fits[T])[['atm','skew']]
+        else:
+            surf = SVIVolSurface(fits[T])
+            surf0 = surf(k,Texp)
+            ts[T] = pd.DataFrame({
+                'atm': surf0[:,1],
+                'skew': (surf0[:,2]-surf0[:,0])/(2*EPS),
+            })
+            ts[T].index = Texp
+    return ts
+
+#### Plot Function #############################################################
+
+def FitError(k, T, fit, bid, ask, errType="chi"):
+    # Fit error based on bid/ask
+    # err carries dimension of vol points
+    n = len(k)
+    mid = (bid+ask)/2
+    sprd = (ask-bid)/2
+    err = None
+    try:
+        if errType == "chi":
+            err = sum((fit-mid)**2/mid) # follows chi-sq(df=n-1)
+        elif errType == "ave":
+            err = np.sqrt(np.mean((fit-mid)**2))
+        elif errType == "ave5": # 5-NS ATM
+            ntm = (k>-0.05)&(k<0.05)
+            spline = InterpolatedUnivariateSpline(k[ntm], mid[ntm])
+            k = k/(spline(0).item()*np.sqrt(T)) # normalized-strike
+            i = (k>-5)&(k<5)
+            err = np.sqrt(np.mean((fit[i]-mid[i])**2))
+        elif errType == "ave5ba": # 5-NS ATM bid/ask-adjusted
+            ntm = (k>-0.05)&(k<0.05)
+            spline = InterpolatedUnivariateSpline(k[ntm], mid[ntm])
+            k = k/(spline(0).item()*np.sqrt(T)) # normalized-strike
+            i = (k>-5)&(k<5)
+            err = np.mean((fit[i]-mid[i])**2/sprd)
+    except Exception as e: print(e)
+    if err: err = np.round(100*err,2)
+    return err
+
+def PlotImpliedVol(df, figname=None, ncol=6, strikeType="log-strike", scatterFit=False, atmBar=False, baBar=False, fitErr=False, plotVolErr=False, xlim=None, ylim=None):
+    # Plot bid-ask implied volatilities based on df
+    # Columns: "Expiry","Texp","Strike","Bid","Ask","Fwd","CallMid","PV"
+    if not figname:
+        figname = "impliedvol.png"
+    Texp = df["Texp"].unique()
+    Nexp = len(Texp)
+    ncol = min(Nexp,ncol)
+    nrow = int(np.ceil(Nexp/ncol))
+
+    if Nexp > 1: # multiple plots
+        fig, ax = plt.subplots(nrow,ncol,figsize=(2.5*ncol,2*nrow))
+    else: # single plot
+        fig, ax = plt.subplots(nrow,ncol,figsize=(6,4))
+
+    for i in range(nrow*ncol):
+        ix,iy = i//ncol,i%ncol
+        idx = (ix,iy) if nrow>1 else iy
+        ax_idx = ax[idx] if ncol>1 else ax
+        if i < Nexp:
+            T = Texp[i]
+            dfT = df[df["Texp"]==T]
+            bid = dfT["Bid"]
+            ask = dfT["Ask"]
+            mid = (bid+ask)/2
+            sprd = (ask-bid)/2
+            ax_idx.set_title(rf"$T={np.round(T,3)}$")
+            ax_idx.set_xlabel(strikeType)
+            ax_idx.set_ylabel("implied vol")
+            if strikeType == "strike":
+                k = dfT["Strike"]
+            elif strikeType == "log-strike":
+                k = np.log(dfT["Strike"]/dfT["Fwd"])
+            elif strikeType == "normalized-strike":
+                k = np.log(dfT["Strike"]/dfT["Fwd"])
+                ntm = (k>-0.05)&(k<0.05)
+                spline = InterpolatedUnivariateSpline(k[ntm], mid[ntm])
+                w = spline(0).item()*np.sqrt(T) # ATM var
+                k = np.log(dfT["Strike"]/dfT["Fwd"])/w
+            elif strikeType == "delta":
+                k = np.log(dfT["Strike"]/dfT["Fwd"])
+                ntm = (k>-0.05)&(k<0.05)
+                spline = InterpolatedUnivariateSpline(k[ntm], mid[ntm])
+                w = spline(0).item()*np.sqrt(T) # ATM var
+                k = ndtr(-k/np.sqrt(w)+np.sqrt(w)/2)
+            if atmBar:
+                if strikeType == "strike":
+                    ax_idx.axvline(x=dfT["Fwd"].iloc[0],c='grey',ls='--',lw=1)
+                elif strikeType == "log-strike":
+                    ax_idx.axvline(x=0,c='grey',ls='--',lw=1)
+                elif strikeType == "normalized-strike":
+                    ax_idx.axvline(x=0,c='grey',ls='--',lw=1)
+                elif strikeType == "delta":
+                    ax_idx.axvline(x=ndtr(np.sqrt(w)/2),c='grey',ls='--',lw=1)
+            if "Fit" in dfT:
+                fit = dfT["Fit"]
+                i = (fit>1e-2)
+                if fitErr:
+                    kk = np.log(dfT["Strike"]/dfT["Fwd"])
+                    # err_chi = FitError(kk[i],T,fit[i],bid[i],ask[i],"chi")
+                    err_ave = FitError(kk[i],T,fit[i],bid[i],ask[i],"ave")
+                    err_ave5 = FitError(kk[i],T,fit[i],bid[i],ask[i],"ave5")
+                    ax_idx.set_title(rf"$T={np.round(T,3)}$ ave$={err_ave}$ ave5$={err_ave5}$",fontsize=8)
+                if plotVolErr:
+                    k = k[i]
+                    sprd = 100*sprd[i]
+                    bid = 100*(bid-fit)[i] # vol error
+                    ask = 100*(ask-fit)[i]
+                    mid = 100*(mid-fit)[i]
+                    ax_idx.axhline(y=0,c='grey',ls='--',lw=1)
+                    ax_idx.set_ylabel("vol error (%)")
+                else:
+                    if scatterFit:
+                        ax_idx.scatter(k[i],fit[i],c='k',s=0.5,zorder=999)
+                    else:
+                        ax_idx.plot(k[i],fit[i],'k',linewidth=1,zorder=999)
+            if baBar:
+                ax_idx.errorbar(k,mid,sprd,marker='o',mec='g',ms=1,
+                    ecolor='g',elinewidth=1,capsize=1,ls='none')
+            else:
+                ax_idx.scatter(k,bid,c='r',s=2,marker="^")
+                ax_idx.scatter(k,ask,c='b',s=2,marker="v")
+            if xlim is not None:
+                ax_idx.set_ylabel(xlim)
+            if ylim is not None:
+                ax_idx.set_ylabel(ylim)
+        else:
+            ax_idx.axis("off")
+
+    fig.tight_layout()
+    plt.savefig(figname)
+    plt.close()
+
+def PlotTotalVar(df, figname=None, xlim=None, ylim=None):
+    # Plot mid total implied variances based on df
+    # Columns: "Expiry","Texp","Strike","Bid","Ask","Fwd","CallMid","PV"
+    if not figname:
+        figname = "impliedvol.png"
+    if not xlim:
+        xlim = [-1,1]
+    if not ylim:
+        ylim = [0,0.1]
+    Texp = df["Texp"].unique()
+    Nexp = len(Texp)
+
+    col = plt.cm.gray(np.linspace(0,0.8,len(Texp)))
+    fig = plt.figure(figsize=(6,4))
+    for i,T in enumerate(Texp):
+        dfT = df[df["Texp"]==T]
+        k = np.log(dfT["Strike"]/dfT["Fwd"])
+        if "Fit" in dfT:
+            mid = dfT["Fit"]
+        else:
+            bid = dfT["Bid"]
+            ask = dfT["Ask"]
+            mid = (bid+ask)/2
+        w = mid**2*T
+        plt.plot(k,w,c=col[i],lw=1)
+    plt.title(f"{len(Texp)} maturities: T={np.round(min(Texp),3)} to {np.round(max(Texp),3)}")
+    plt.xlabel("log-strike")
+    plt.ylabel("total implied var")
+    plt.xlim(xlim)
+    plt.ylim(ylim)
+    fig.tight_layout()
+    plt.savefig(figname)
+    plt.close()
+
+def PlotImpliedVolSurface(df, figname=None, model=None, surfaceOnly=False):
+    # Plot implied vol surface based on df
+    # Columns: "Log-strike","Texp","IV"
+    if not figname: figname = "IVS.png"
+
+    df = df.dropna()
+
+    logStrike = df["Log-strike"]
+    maturity  = df["Texp"]
+    impVol    = df["IV"]*100
+
+    fig = plt.figure(figsize=(6,6))
+    ax = plt.axes(projection="3d")
+
+    if surfaceOnly: # Demo w/o axes
+        surf = ax.plot_trisurf(logStrike,maturity,impVol,cmap='copper',alpha=0.8)
+        fig.subplots_adjust(left=0,right=1,bottom=0,top=1)
+        ax.axis('off')
+    else:
+        surf = ax.plot_trisurf(logStrike,maturity,impVol,cmap='summer')
+        fig.subplots_adjust(left=0,right=0.9,bottom=0,top=1)
+
+    ax.set_box_aspect((2,2,1))
+    ax.set_xlabel("log-strike")
+    ax.set_ylabel("maturity")
+    ax.set_zlabel("implied vol")
+    if model: ax.set_title(model)
+
+    plt.savefig(figname)
+    plt.close()
+
+def CalcAtmVolAndSkew(df):
+    # Calculate implied vols & skews based on df, with cubic interpolation
+    # Columns: "Expiry","Texp","Strike","Bid","Ask","Fwd","CallMid","PV"
+    Texp = df["Texp"].unique()
+    atmVol = list()
+    atmSkew = list()
+
+    for T in Texp:
+        dfT = df[df["Texp"]==T]
+        k = np.log(dfT["Strike"]/dfT["Fwd"]).to_numpy()
+        mid = ((dfT["Bid"]+dfT["Ask"])/2).to_numpy()
+        ntm = (k>-0.05)&(k<0.05)
+        spline = InterpolatedUnivariateSpline(k[ntm], mid[ntm])
+        atmVol.append(spline(0).item())
+        atmSkew.append(spline.derivatives(0)[1])
+
+    atmVol = np.array(atmVol)
+    atmSkew = np.array(atmSkew)
+    return {"Texp": Texp, "atmVol": atmVol, "atmSkew": atmSkew}
