@@ -2,14 +2,46 @@ import numpy as np
 import scipy as sp
 import pandas as pd
 import matplotlib.pyplot as plt
-from time import time
 from numba import njit
 from statistics import NormalDist
 from scipy.special import ndtr
 from scipy.optimize import bisect, minimize, differential_evolution
 from scipy.interpolate import interp1d, InterpolatedUnivariateSpline
-from pricer import BlackScholesFormula, BlackScholesImpliedVol
 plt.switch_backend("Agg")
+
+#### Black Scholes #############################################################
+
+def BlackScholesFormula(spotPrice, strike, maturity, riskFreeRate, impliedVol, optionType):
+    # Black Scholes formula for call/put
+    logMoneyness = np.log(spotPrice/strike)+riskFreeRate*maturity
+    totalImpVol = impliedVol*np.sqrt(maturity)
+    discountFactor = np.exp(-riskFreeRate*maturity)
+    d1 = logMoneyness/totalImpVol+totalImpVol/2
+    d2 = d1-totalImpVol
+
+    price = np.where(optionType == "call",
+        spotPrice * ndtr(d1) - discountFactor * strike * ndtr(d2),
+        discountFactor * strike * ndtr(-d2) - spotPrice * ndtr(-d1))
+    return price
+
+def BlackScholesImpliedVol(spotPrice, strike, maturity, riskFreeRate, priceMkt, optionType):
+    # Black Scholes implied volatility for call/put/OTM
+    forwardPrice = spotPrice*np.exp(riskFreeRate*maturity)
+    nStrikes = len(strike) if isinstance(strike, np.ndarray) else 1
+    impVol = np.repeat(0., nStrikes)
+
+    impVol0 = np.repeat(1e-10, nStrikes)
+    impVol1 = np.repeat(10., nStrikes)
+    price0 = BlackScholesFormula(spotPrice, strike, maturity, riskFreeRate, impVol0, optionType)
+    price1 = BlackScholesFormula(spotPrice, strike, maturity, riskFreeRate, impVol1, optionType)
+    while np.mean(impVol1-impVol0) > 1e-10:
+        impVol = (impVol0+impVol1)/2
+        price = BlackScholesFormula(spotPrice, strike, maturity, riskFreeRate, impVol, optionType)
+        price0 += (price<priceMkt)*(price-price0)
+        impVol0 += (price<priceMkt)*(impVol-impVol0)
+        price1 += (price>=priceMkt)*(price-price1)
+        impVol1 += (price>=priceMkt)*(impVol-impVol1)
+    return impVol
 
 #### Global Variables ##########################################################
 
@@ -615,3 +647,126 @@ def FitEnsembleCarrPelts(df, n=2, zgridCfg=(-100,150,50), gamma0Cfg=(1,1), fixVo
     CP['a'] = a
 
     return CP
+
+#### Plot Function #############################################################
+
+def FitError(k, T, fit, bid, ask, errType="chi"):
+    # Fit error based on bid/ask
+    # err carries dimension of vol points
+    n = len(k)
+    mid = (bid+ask)/2
+    sprd = (ask-bid)/2
+    err = None
+    try:
+        if errType == "chi":
+            err = sum((fit-mid)**2/mid) # follows chi-sq(df=n-1)
+        elif errType == "ave":
+            err = np.sqrt(np.mean((fit-mid)**2))
+        elif errType == "ave5": # 5-NS ATM
+            ntm = (k>-0.05)&(k<0.05)
+            spline = InterpolatedUnivariateSpline(k[ntm], mid[ntm])
+            k = k/(spline(0).item()*np.sqrt(T)) # normalized-strike
+            i = (k>-5)&(k<5)
+            err = np.sqrt(np.mean((fit[i]-mid[i])**2))
+        elif errType == "ave5ba": # 5-NS ATM bid/ask-adjusted
+            ntm = (k>-0.05)&(k<0.05)
+            spline = InterpolatedUnivariateSpline(k[ntm], mid[ntm])
+            k = k/(spline(0).item()*np.sqrt(T)) # normalized-strike
+            i = (k>-5)&(k<5)
+            err = np.mean((fit[i]-mid[i])**2/sprd)
+    except Exception as e: print(e)
+    if err: err = np.round(100*err,2)
+    return err
+
+def PlotImpliedVol(df, figname=None, ncol=6, strikeType="log-strike", scatterFit=False, atmBar=False, baBar=False, fitErr=False, plotVolErr=False, xlim=None, ylim=None):
+    # Plot bid-ask implied volatilities based on df
+    # Columns: "Expiry","Texp","Strike","Bid","Ask","Fwd","CallMid","PV"
+    if not figname:
+        figname = "impliedvol.png"
+    Texp = df["Texp"].unique()
+    Nexp = len(Texp)
+    ncol = min(Nexp,ncol)
+    nrow = int(np.ceil(Nexp/ncol))
+
+    if Nexp > 1: # multiple plots
+        fig, ax = plt.subplots(nrow,ncol,figsize=(2.5*ncol,2*nrow))
+    else: # single plot
+        fig, ax = plt.subplots(nrow,ncol,figsize=(6,4))
+
+    for i in range(nrow*ncol):
+        ix,iy = i//ncol,i%ncol
+        idx = (ix,iy) if nrow>1 else iy
+        ax_idx = ax[idx] if ncol>1 else ax
+        if i < Nexp:
+            T = Texp[i]
+            dfT = df[df["Texp"]==T]
+            bid = dfT["Bid"]
+            ask = dfT["Ask"]
+            mid = (bid+ask)/2
+            sprd = (ask-bid)/2
+            ax_idx.set_title(rf"$T={np.round(T,3)}$")
+            ax_idx.set_xlabel(strikeType)
+            ax_idx.set_ylabel("implied vol")
+            if strikeType == "strike":
+                k = dfT["Strike"]
+            elif strikeType == "log-strike":
+                k = np.log(dfT["Strike"]/dfT["Fwd"])
+            elif strikeType == "normalized-strike":
+                k = np.log(dfT["Strike"]/dfT["Fwd"])
+                ntm = (k>-0.05)&(k<0.05)
+                spline = InterpolatedUnivariateSpline(k[ntm], mid[ntm])
+                w = spline(0).item()*np.sqrt(T) # ATM var
+                k = np.log(dfT["Strike"]/dfT["Fwd"])/w
+            elif strikeType == "delta":
+                k = np.log(dfT["Strike"]/dfT["Fwd"])
+                ntm = (k>-0.05)&(k<0.05)
+                spline = InterpolatedUnivariateSpline(k[ntm], mid[ntm])
+                w = spline(0).item()*np.sqrt(T) # ATM var
+                k = ndtr(-k/np.sqrt(w)+np.sqrt(w)/2)
+            if atmBar:
+                if strikeType == "strike":
+                    ax_idx.axvline(x=dfT["Fwd"].iloc[0],c='grey',ls='--',lw=1)
+                elif strikeType == "log-strike":
+                    ax_idx.axvline(x=0,c='grey',ls='--',lw=1)
+                elif strikeType == "normalized-strike":
+                    ax_idx.axvline(x=0,c='grey',ls='--',lw=1)
+                elif strikeType == "delta":
+                    ax_idx.axvline(x=ndtr(np.sqrt(w)/2),c='grey',ls='--',lw=1)
+            if "Fit" in dfT:
+                fit = dfT["Fit"]
+                i = (fit>1e-2)
+                if fitErr:
+                    kk = np.log(dfT["Strike"]/dfT["Fwd"])
+                    # err_chi = FitError(kk[i],T,fit[i],bid[i],ask[i],"chi")
+                    err_ave = FitError(kk[i],T,fit[i],bid[i],ask[i],"ave")
+                    err_ave5 = FitError(kk[i],T,fit[i],bid[i],ask[i],"ave5")
+                    ax_idx.set_title(rf"$T={np.round(T,3)}$ ave$={err_ave}$ ave5$={err_ave5}$",fontsize=8)
+                if plotVolErr:
+                    k = k[i]
+                    sprd = 100*sprd[i]
+                    bid = 100*(bid-fit)[i] # vol error
+                    ask = 100*(ask-fit)[i]
+                    mid = 100*(mid-fit)[i]
+                    ax_idx.axhline(y=0,c='grey',ls='--',lw=1)
+                    ax_idx.set_ylabel("vol error (%)")
+                else:
+                    if scatterFit:
+                        ax_idx.scatter(k[i],fit[i],c='k',s=0.5,zorder=999)
+                    else:
+                        ax_idx.plot(k[i],fit[i],'k',linewidth=1,zorder=999)
+            if baBar:
+                ax_idx.errorbar(k,mid,sprd,marker='o',mec='g',ms=1,
+                    ecolor='g',elinewidth=1,capsize=1,ls='none')
+            else:
+                ax_idx.scatter(k,bid,c='r',s=2,marker="^")
+                ax_idx.scatter(k,ask,c='b',s=2,marker="v")
+            if xlim is not None:
+                ax_idx.set_ylabel(xlim)
+            if ylim is not None:
+                ax_idx.set_ylabel(ylim)
+        else:
+            ax_idx.axis("off")
+
+    fig.tight_layout()
+    plt.savefig(figname)
+    plt.close()
