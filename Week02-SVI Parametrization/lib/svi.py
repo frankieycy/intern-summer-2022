@@ -592,11 +592,15 @@ def FitArbFreeSimpleSVI(df, sviGuess=None, initParamsMode=0, cArbPenalty=10000, 
         bid = dfT["Bid"]
         ask = dfT["Ask"]
         mid = (bid+ask)/2
+        midVar = (bid**2+ask**2)/2
+        sprdVar = (ask**2-bid**2)/2
         callMid = dfT["CallMid"]
 
         F = F.to_numpy()
         K = K.to_numpy()
         k = k.to_numpy()
+        midVar = midVar.to_numpy()
+        sprdVar = sprdVar.to_numpy()
         callMid = callMid.to_numpy()
 
         if l2Weight == "Vega":
@@ -614,13 +618,18 @@ def FitArbFreeSimpleSVI(df, sviGuess=None, initParamsMode=0, cArbPenalty=10000, 
         def prxToL2Loss(callSvi): # Fast loss computation!
             return np.sum(w*(callSvi-callMid)**2)
 
+        @njit
+        def varToL2Loss(sviVar): # Fast loss computation!
+            return np.sum(((sviVar-midVar)/sprdVar)**2)
+
         def l2Loss(params): # L2 loss
             # sviVar = svi(*params)(k)/T
             sviVar = svi_jit(k,*params)/T
-            callSvi = BlackScholesFormula_jit(F,K,T,0,np.sqrt(np.abs(sviVar)),'call')
-            # callSvi = BlackScholesFormula(F,K,T,0,np.sqrt(np.abs(sviVar)),'call')
-            # loss = sum(w*(callSvi-callMid)**2)
-            loss = prxToL2Loss(callSvi)
+            # callSvi = BlackScholesFormula_jit(F,K,T,0,np.sqrt(np.abs(sviVar)),'call')
+            # # callSvi = BlackScholesFormula(F,K,T,0,np.sqrt(np.abs(sviVar)),'call')
+            # # loss = sum(w*(callSvi-callMid)**2)
+            # loss = prxToL2Loss(callSvi)
+            loss = varToL2Loss(sviVar)
             return loss
 
         def caLoss(params): # Calendar arb loss

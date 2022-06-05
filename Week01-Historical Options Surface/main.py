@@ -16,6 +16,16 @@ def test_GenIvDatasetQQQ():
     ivdf.to_csv('out/test_qqqVol220414.csv',index=False)
     PlotImpliedVol(ivdf,"out/test_qqqVol220414.png",ncol=8,baBar=True)
 
+def test_GenIvDatasetSPX():
+    df = pd.read_csv('data/test_SPX220603_cboe.csv')
+    df = CleanCboeOptionsChainDataset(df,'data/test_SPX220603.csv')
+    df = StandardizeOptionsChainDataset(df,'2022-06-03')
+    ivdf = GenerateImpVolDatasetFromStdDf(df,volCorrection='delta')
+    ivdf = SimplifyDatasetByPeriod(ivdf,select='latest')
+    ivdf.to_csv('out/test_spxVol220603.csv',index=False)
+    PlotImpliedVol(ivdf,"out/test_spxVol220603.png",ncol=9,baBar=True)
+
 if __name__ == '__main__':
-    test_GenIvDatasetSPY()
-    test_GenIvDatasetQQQ()
+    # test_GenIvDatasetSPY()
+    # test_GenIvDatasetQQQ()
+    test_GenIvDatasetSPX()

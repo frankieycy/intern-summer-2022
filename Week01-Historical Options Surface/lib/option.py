@@ -72,6 +72,26 @@ def GenerateYfinOptionsChainDataset(fileName, underlying="^SPX"):
     optionChains.to_csv(fileName, index=False)
     return optionChains
 
+def CleanCboeOptionsChainDataset(df, fileName=None):
+    # Clean options chain dataset from CBOE
+    Texp = df['Expiration Date'].unique()
+    optionChains = list()
+    for T in Texp:
+        dfT = df[df['Expiration Date']==T].copy()
+        dfC = dfT.iloc[:,1:11]
+        dfP = dfT.iloc[:,12:]
+        dfC.columns = dfP.columns = ['Contract Name','Last Sale','Net','Bid','Ask','Volume','IV','Delta','Gamma','Open Interest']
+        dfC['Strike'] = dfP['Strike'] = dfT['Strike']
+        dfC['Put/Call'] = 'Call'
+        dfP['Put/Call'] = 'Put'
+        dfCP = pd.concat([dfC,dfP])
+        dfCP['Expiry'] = T
+        dfCP = dfCP[['Contract Name','Put/Call','Strike','Last Sale','Net','Bid','Ask','Volume','IV','Delta','Gamma','Open Interest']]
+        optionChains.append(dfCP)
+    optionChains = pd.concat(optionChains)
+    if fileName: optionChains.to_csv(fileName, index=False)
+    return optionChains
+
 def StandardizeOptionsChainDataset(df, onDate):
     # Standardize options chain dataset
     # Columns: "Contract Name","Put/Call","Strike","Bid","Ask"
