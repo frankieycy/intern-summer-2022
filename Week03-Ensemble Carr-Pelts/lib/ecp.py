@@ -2,7 +2,7 @@ import numpy as np
 import scipy as sp
 import pandas as pd
 import matplotlib.pyplot as plt
-from numba import njit
+from numba import njit, float64, vectorize
 from statistics import NormalDist
 from scipy.special import ndtr
 from scipy.optimize import bisect, minimize, differential_evolution
@@ -10,6 +10,49 @@ from scipy.interpolate import interp1d, InterpolatedUnivariateSpline
 plt.switch_backend("Agg")
 
 #### Black Scholes #############################################################
+
+INVROOT2PI = 0.3989422804014327
+
+@njit(float64(float64), fastmath=True, cache=True)
+def _ndtr_jit(x):
+    a1 = 0.319381530
+    a2 = -0.356563782
+    a3 = 1.781477937
+    a4 = -1.821255978
+    a5 = 1.330274429
+    g = 0.2316419
+
+    k = 1.0 / (1.0 + g * np.abs(x))
+    k2 = k * k
+    k3 = k2 * k
+    k4 = k3 * k
+    k5 = k4 * k
+
+    if x >= 0.0:
+        c = (a1 * k + a2 * k2 + a3 * k3 + a4 * k4 + a5 * k5)
+        phi = 1.0 - c * np.exp(-x*x/2.0) * INVROOT2PI
+    else:
+        phi = 1.0 - _ndtr_jit(-x)
+
+    return phi
+
+@vectorize([float64(float64)], fastmath=True, cache=True)
+def ndtr_jit(x):
+    return _ndtr_jit(x)
+
+@njit
+def BlackScholesFormula_jit(spotPrice, strike, maturity, riskFreeRate, impliedVol, optionType):
+    # Black Scholes formula for call/put (jit implementation)
+    logMoneyness = np.log(spotPrice/strike)+riskFreeRate*maturity
+    totalImpVol = impliedVol*np.sqrt(maturity)
+    discountFactor = np.exp(-riskFreeRate*maturity)
+    d1 = logMoneyness/totalImpVol+totalImpVol/2
+    d2 = d1-totalImpVol
+
+    if optionType == 'call':
+        return spotPrice * ndtr_jit(d1) - discountFactor * strike * ndtr_jit(d2)
+    else:
+        return discountFactor * strike * ndtr_jit(-d2) - spotPrice * ndtr_jit(-d1)
 
 def BlackScholesFormula(spotPrice, strike, maturity, riskFreeRate, impliedVol, optionType):
     # Black Scholes formula for call/put
@@ -24,23 +67,46 @@ def BlackScholesFormula(spotPrice, strike, maturity, riskFreeRate, impliedVol, o
         discountFactor * strike * ndtr(-d2) - spotPrice * ndtr(-d1))
     return price
 
-def BlackScholesImpliedVol(spotPrice, strike, maturity, riskFreeRate, priceMkt, optionType):
-    # Black Scholes implied volatility for call/put/OTM
-    forwardPrice = spotPrice*np.exp(riskFreeRate*maturity)
-    nStrikes = len(strike) if isinstance(strike, np.ndarray) else 1
-    impVol = np.repeat(0., nStrikes)
-
+@njit
+def BlackScholesImpliedVol_jitBisect(spotPrice, strike, maturity, riskFreeRate, priceMkt, optionType):
+    # Black Scholes implied volatility via Bisection for call/put
+    nStrikes = len(strike)
+    impVol = np.zeros(nStrikes)
     impVol0 = np.repeat(1e-10, nStrikes)
     impVol1 = np.repeat(10., nStrikes)
-    price0 = BlackScholesFormula(spotPrice, strike, maturity, riskFreeRate, impVol0, optionType)
-    price1 = BlackScholesFormula(spotPrice, strike, maturity, riskFreeRate, impVol1, optionType)
+    price0 = BlackScholesFormula_jit(spotPrice, strike, maturity, riskFreeRate, impVol0, optionType)
+    price1 = BlackScholesFormula_jit(spotPrice, strike, maturity, riskFreeRate, impVol1, optionType)
     while np.mean(impVol1-impVol0) > 1e-10:
         impVol = (impVol0+impVol1)/2
-        price = BlackScholesFormula(spotPrice, strike, maturity, riskFreeRate, impVol, optionType)
+        price = BlackScholesFormula_jit(spotPrice, strike, maturity, riskFreeRate, impVol, optionType)
         price0 += (price<priceMkt)*(price-price0)
         impVol0 += (price<priceMkt)*(impVol-impVol0)
         price1 += (price>=priceMkt)*(price-price1)
         impVol1 += (price>=priceMkt)*(impVol-impVol1)
+    return impVol
+
+def BlackScholesImpliedVol(spotPrice, strike, maturity, riskFreeRate, priceMkt, optionType, method="Bisection"):
+    # Black Scholes implied volatility for call/put
+    forwardPrice = spotPrice*np.exp(riskFreeRate*maturity)
+    nStrikes = len(strike) if isinstance(strike, np.ndarray) else 1
+    impVol = np.repeat(0., nStrikes)
+
+    if method == "Bisection":
+        impVol0 = np.repeat(1e-10, nStrikes)
+        impVol1 = np.repeat(10., nStrikes)
+        price0 = BlackScholesFormula(spotPrice, strike, maturity, riskFreeRate, impVol0, optionType)
+        price1 = BlackScholesFormula(spotPrice, strike, maturity, riskFreeRate, impVol1, optionType)
+        while np.mean(impVol1-impVol0) > 1e-10:
+            impVol = (impVol0+impVol1)/2
+            price = BlackScholesFormula(spotPrice, strike, maturity, riskFreeRate, impVol, optionType)
+            price0 += (price<priceMkt)*(price-price0)
+            impVol0 += (price<priceMkt)*(impVol-impVol0)
+            price1 += (price>=priceMkt)*(price-price1)
+            impVol1 += (price>=priceMkt)*(impVol-impVol1)
+
+    elif method == "Bisection_jit":
+        impVol = BlackScholesImpliedVol_jitBisect(spotPrice, strike, maturity, riskFreeRate, priceMkt, optionType)
+
     return impVol
 
 #### Global Variables ##########################################################
@@ -252,7 +318,7 @@ def CarrPeltsPrice(K, T, D, F, tau, h, ohm, zgrid, X=None, tauT=None, **kwargs):
     P = np.nan_to_num(P) # small gamma makes Dpos/neg blow up
     return P
 
-def CarrPeltsImpliedVol(K, T, D, F, tau, h, ohm, zgrid, X=None, tauT=None, methodIv='Bisection', **kwargs):
+def CarrPeltsImpliedVol(K, T, D, F, tau, h, ohm, zgrid, X=None, tauT=None, methodIv='Bisection_jit', **kwargs):
     # Compute Carr-Pelts price and invert to implied vol
     P = CarrPeltsPrice(K, T, D, F, tau, h, ohm, zgrid, X, tauT, **kwargs)
     vol = BlackScholesImpliedVol(F, K, T, 0, P/D, 'call', methodIv)
