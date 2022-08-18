@@ -56,7 +56,10 @@ def test_ImpVolECP():
 
     #### alpha/beta/gamma, fixVol=True
     params = np.array(
-      [] # fill ECP optimization here
+      [ 0.85543093,  0.05385916,  2.30915485,  1.81397698,  0.68191239,
+        0.60301994,  2.51595808,  1.29461596, -0.566967  ,  1.87596517,
+        4.90807089,  0.0453925 ,  0.03180923,  4.74765957,  0.61326273,
+        0.09474174 ]
     )
 
     n = len(params)//(3+N+Nexp*(1-fixVol))
@@ -95,7 +98,7 @@ def test_ImpVolECP():
 
     print(df.head(20))
 
-    PlotImpliedVol(df, "out/test_spx220603ECP.png", scatterFit=True, ncol=7, atmBar=True, baBar=True)
+    PlotImpliedVol(df, "out/test_spx220603ECP.png", scatterFit=True, ncol=8, atmBar=True, baBar=True)
 
 if __name__ == '__main__':
     test_FitCarrPelts()

@@ -30,6 +30,26 @@ def test_ImpVolHES():
     dfnew = pd.concat(dfnew)
     PlotImpliedVol(dfnew, "out/test_spx220603HES.png", ncol=8, atmBar=True, baBar=True, fitErr=True)
 
+def test_LargeTimeHestonSmile():
+    hesParams = {'vbar': 0.04, 'rho': -0.7, 'eta': 0.1, 'lda': 1}
+    params = {"meanRevRate": 1, "correlation": -0.7, "volOfVol": 0.1, "meanVar": 0.04, "currentVar": 0.04}
+    ivFunc = CharFuncImpliedVol(HestonCharFunc(**params), optionType="call", FFT=True)
+    x = np.arange(-1,1,0.002)
+    T = 20
+    k = x*T
+    sig = ivFunc(k,T)
+    fig = plt.figure(figsize=(6,4))
+    plt.scatter(x,sig,c='k',s=2)
+    plt.xlabel('time-scaled log-strike')
+    plt.ylabel('implied volatility')
+    plt.title(f'Heston Large-Time Smile: {hesParams}',fontsize=10)
+    plt.xlim([-1,1])
+    plt.ylim([0.05,0.40])
+    fig.tight_layout()
+    plt.savefig('out/hesSmile.png')
+    plt.close()
+
 if __name__ == '__main__':
-    test_CalibrateHES()
-    test_ImpVolHES()
+    # test_CalibrateHES()
+    # test_ImpVolHES()
+    test_LargeTimeHestonSmile()
